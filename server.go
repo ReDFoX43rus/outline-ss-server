@@ -16,6 +16,7 @@ package main
 
 import (
 	"container/list"
+	"features"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -72,6 +73,7 @@ type SSServer struct {
 	m           metrics.ShadowsocksMetrics
 	replayCache service.ReplayCache
 	ports       map[int]*ssPort
+	connlimit   features.ConnLimit
 }
 
 func (s *SSServer) startPort(portNum int) error {
@@ -86,7 +88,7 @@ func (s *SSServer) startPort(portNum int) error {
 	logger.Infof("Listening TCP and UDP on port %v", portNum)
 	port := &ssPort{cipherList: service.NewCipherList()}
 	// TODO: Register initial data metrics at zero.
-	port.tcpService = service.NewTCPService(port.cipherList, &s.replayCache, s.m, tcpReadTimeout)
+	port.tcpService = service.NewTCPService(port.cipherList, &s.replayCache, s.m, tcpReadTimeout, s.connlimit)
 	port.udpService = service.NewUDPService(s.natTimeout, port.cipherList, s.m)
 	s.ports[portNum] = port
 	go port.tcpService.Serve(listener)
@@ -168,12 +170,20 @@ func (s *SSServer) Stop() error {
 
 // RunSSServer starts a shadowsocks server running, and returns the server or an error.
 func RunSSServer(filename string, natTimeout time.Duration, sm metrics.ShadowsocksMetrics, replayHistory int) (*SSServer, error) {
+	var maxAllowedConnections []features.AllowedConnections
+	maxAllowedConnections = append(maxAllowedConnections, features.AllowedConnections{
+		Id:             "user-0",
+		MaxConnections: 1,
+	})
+
 	server := &SSServer{
 		natTimeout:  natTimeout,
 		m:           sm,
 		replayCache: service.NewReplayCache(replayHistory),
 		ports:       make(map[int]*ssPort),
+		connlimit:   features.MakeConnLimitInfo(maxAllowedConnections, true),
 	}
+
 	err := server.loadConfig(filename)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to load config file %v: %v", filename, err)

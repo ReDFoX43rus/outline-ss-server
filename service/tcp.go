@@ -22,9 +22,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
+
+	features "features"
 
 	onet "github.com/Jigsaw-Code/outline-ss-server/net"
 	"github.com/Jigsaw-Code/outline-ss-server/service/metrics"
@@ -63,7 +66,7 @@ func debugTCP(cipherID, template string, val interface{}) {
 // required = saltSize + 2 + cipher.TagSize, the number of bytes needed to authenticate the connection.
 const bytesForKeyFinding = 50
 
-func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherList) (*CipherEntry, io.Reader, []byte, time.Duration, error) {
+func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherList, connlimit features.ConnLimit) (*CipherEntry, io.Reader, []byte, time.Duration, error) {
 	// We snapshot the list because it may be modified while we use it.
 	ciphers := cipherList.SnapshotForClientIP(clientIP)
 	firstBytes := make([]byte, bytesForKeyFinding)
@@ -78,6 +81,12 @@ func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherLis
 		// TODO: Ban and log client IPs with too many failures too quick to protect against DoS.
 		return nil, clientReader, nil, timeToCipher, fmt.Errorf("Could not find valid TCP cipher")
 	}
+
+	if !connlimit.CanEstablishNewConnection(entry.ID, clientIP) {
+		return entry, clientReader, nil, timeToCipher, fmt.Errorf("Max number of connections used")
+	}
+
+	connlimit.OnConnectionEstablished(entry.ID, clientIP)
 
 	// Move the active cipher to the front, so that the search is quicker next time.
 	cipherList.MarkUsedByClientIP(elt, clientIP)
@@ -119,17 +128,19 @@ type tcpService struct {
 	// `replayCache` is a pointer to SSServer.replayCache, to share the cache among all ports.
 	replayCache       *ReplayCache
 	targetIPValidator onet.TargetIPValidator
+	connlimit         features.ConnLimit
 }
 
 // NewTCPService creates a TCPService
 // `replayCache` is a pointer to SSServer.replayCache, to share the cache among all ports.
-func NewTCPService(ciphers CipherList, replayCache *ReplayCache, m metrics.ShadowsocksMetrics, timeout time.Duration) TCPService {
+func NewTCPService(ciphers CipherList, replayCache *ReplayCache, m metrics.ShadowsocksMetrics, timeout time.Duration, connlimit features.ConnLimit) TCPService {
 	return &tcpService{
 		ciphers:           ciphers,
 		m:                 m,
 		readTimeout:       timeout,
 		replayCache:       replayCache,
 		targetIPValidator: onet.RequirePublicIP,
+		connlimit:         connlimit,
 	}
 }
 
@@ -205,6 +216,7 @@ func (s *tcpService) Serve(listener *net.TCPListener) error {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Errorf("Panic in TCP handler: %v", r)
+					logger.Errorf(string(debug.Stack()))
 				}
 			}()
 			s.handleConnection(listener.Addr().(*net.TCPAddr).Port, clientTCPConn)
@@ -226,7 +238,7 @@ func (s *tcpService) handleConnection(listenerPort int, clientTCPConn *net.TCPCo
 	clientTCPConn.SetReadDeadline(connStart.Add(s.readTimeout))
 	var proxyMetrics metrics.ProxyMetrics
 	clientConn := metrics.MeasureConn(clientTCPConn, &proxyMetrics.ProxyClient, &proxyMetrics.ClientProxy)
-	cipherEntry, clientReader, clientSalt, timeToCipher, keyErr := findAccessKey(clientConn, remoteIP(clientTCPConn), s.ciphers)
+	cipherEntry, clientReader, clientSalt, timeToCipher, keyErr := findAccessKey(clientConn, remoteIP(clientTCPConn), s.ciphers, s.connlimit)
 
 	connError := func() *onet.ConnectionError {
 		if keyErr != nil {
@@ -235,6 +247,8 @@ func (s *tcpService) handleConnection(listenerPort int, clientTCPConn *net.TCPCo
 			s.absorbProbe(listenerPort, clientConn, clientLocation, status, &proxyMetrics)
 			return onet.NewConnectionError(status, "Failed to find a valid cipher", keyErr)
 		}
+
+		defer s.connlimit.OnConnectionLost(cipherEntry.ID, remoteIP(clientTCPConn))
 
 		isServerSalt := cipherEntry.SaltGenerator.IsServerSalt(clientSalt)
 		// Only check the cache if findAccessKey succeeded and the salt is unrecognized.
